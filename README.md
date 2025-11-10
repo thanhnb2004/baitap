@@ -1,195 +1,239 @@
-# BÀI TẬP LỚN: LẬP TRÌNH MẠNG  
+# Triển khai Kubernetes on-premise với Cilium
 
-## Understanding Cilium: The Next-Gen CNI for Kubernetes
-
-> 📘 README này mô tả chi tiết hệ thống triển khai thật, sử dụng Kubernetes on-premise với Cilium làm cơ chế load balancing cho các container backend xử lý TCP/UDP.
+Tài liệu này tổng hợp toàn bộ các bước dựng cụm Kubernetes on-premise sử dụng Cilium làm CNI (thay thế kube-proxy) để cân bằng tải lưu lượng TCP/UDP cho các backend service của nhóm. Các hướng dẫn được biên soạn lại từ file `hd cài k8s.docx` và đã được chuẩn hoá thành các đoạn lệnh có thể chạy trực tiếp trên Ubuntu Server.
 
 ---
 
-## 🧑‍💻 THÔNG TIN NHÓM
+## 1. Kiến trúc tổng quan
 
-| STT | Họ và Tên | MSSV | Email | Đóng góp |
-|-----|-----------|------|-------|----------|
-| 1 | Nguyễn Bá Thành | B22DCCN793 | thanhkeu2k4@gmail.com | ... |
-| 2 | Trần Thị B | 20IT002 | b@example.com | ... |
-| 3 | Lê Văn C | 20IT003 | c@example.com | ... |
+| Thành phần | Mô tả |
+|------------|-------|
+| Control Plane | 01 máy chủ (Ubuntu Server) cài kubeadm, kubelet, kubectl và chạy Cilium agent |
+| Worker Nodes | 02 máy chủ (Ubuntu Server) cài kubeadm, kubelet, kubelet và tham gia cụm bằng `kubeadm join` |
+| Container Runtime | containerd (cgroup driver = `systemd`) |
+| CNI | Cilium 1.18.3 (cài bằng `cilium install`) |
+| Ứng dụng | Java TCP/UDP backend (xem `source/server/README.md`) và Java Swing client (xem `source/client/README.md`) |
 
-**Tên nhóm:** Nhóm 07 – Lập trình mạng  
-**Chủ đề đã đăng ký:** Understanding Cilium: The Next-Gen CNI for Kubernetes
-
----
-
-## 🧠 MÔ TẢ HỆ THỐNG
-
-
-Hệ thống Kubernetes On-Premise với CNI Cilium Load Balancing
-
-Hệ thống được triển khai trên Kubernetes on-premise gồm 3 node:
-
-- 1 Control Plane Node chịu trách nhiệm quản lý, điều phối tài nguyên trong cluster.
-
-- 2 Worker Node, mỗi node chạy 3 Pod (tổng cộng 6 Pod) đảm nhận xử lý các yêu cầu từ client.
-
-Mỗi Pod chứa container backend (được kéo trực tiếp từ Docker Hub), chạy dịch vụ TCP/UDP Server được viết bằng Java. Ứng dụng ClientApp trên máy người dùng gửi nhiều request TCP/UDP đồng thời đến cluster và nhân lai mot bang thong ke bao gom do tre trung binh moi lan giao tiep giua backend-client, so request duoc xu ly o moi pod co dia chi ip rieng, giúp kiểm thử hiệu quả của cơ chế load balancing do Cilium đảm nhiệm. Cilium đóng vai trò là CNI Plugin thay thế kube-proxy, sử dụng công nghệ eBPF trong nhân Linux để can bang tai (load blancing ) luu luong TCP/UDP giua cac Pod trong mot cluster.
-
-Khi client gửi yêu cầu, Cilium tự động phân phối các gói TCP/UDP đến các Pod backend trên hai worker node, giúp hệ thống đạt được khả năng phân tải thông minh, giảm độ trễ và tối ưu băng thông.
-
-> NOTE: Toan bo he thong k8s duoc trien khai tren cac may ao ubnutu server  
- 
-
-
-**Cấu trúc logic tổng quát:**
-```
-        ┌────────────────────────┐
-         │        Client          │
-         │  n Request TCP / UDP   │
-         └──────────┬─────────────┘
-                    │
-                    ▼
-        ┌──────────────────────────────┐
-        │       Control Plane          │
-        │ ┌──────────────────────────┐ │
-        │ │     kube-apiserver       │ │
-        │ │     scheduler            │ │
-        │ │     etcd                 │ │
-        │ │     Cilium Agent         │ │
-        │ └──────────────────────────┘ │
-        └──────────┬───────────────────┘
-                   │
-     ┌─────────────┼──────────────────────────┐
-     │                                          │
-     ▼                                          ▼
-┌──────────────────────────┐        ┌──────────────────────────┐
-│     Worker Node #1       │        │     Worker Node #2       │
-│ ┌──────────────────────┐ │        │ ┌──────────────────────┐ │
-│ │ Pod1  Pod2  Pod3     │ │        │ │ Pod1  Pod2  Pod3     │ │
-│ │ (Container backend)  │ │        │ │ (Container backend)  │ │
-│ └──────────────────────┘ │        │ └──────────────────────┘ │
-│                          │        │                          │
-│ containerd + kubelet     │        │ containerd + kubelet     │
-│ Cilium Agent (eBPF)      │        │ Cilium Agent (eBPF)      │
-└──────────────────────────┘        └──────────────────────────┘
--------------------------------
-Sơ đồ hoạt động chi tiết
--------------------------------
-Client
-  │ TCP dst=NodeIP_cp:31000
-  ▼
-[Control-Plane Node]
-  NIC(rx) → eBPF(tc/XDP)
-    → svc map lookup → pick PodIP on worker-01
-    → DNAT (and SNAT if policy=Cluster)
-    → Encapsulate VXLAN to NodeIP_worker1
-  NIC(tx) ───────────────────────────────►
-  [Worker-01 Node]
-  NIC(rx) → eBPF → Decap VXLAN → revNAT/CT → veth → Pod
-  Pod handles → veth → eBPF → reverse NAT → (VXLAN/direct)
-  NIC(tx) ───────────────────────────────► Client
-
-```
-
-**Sơ đồ hệ thống:**
-
-![System Diagram](./statics/diagram.png)
+Các node giao tiếp qua mạng nội bộ (Layer 2). Cilium đảm nhiệm routing eBPF, load balancing lưu lượng tới các Pod backend trên 2 worker node.
 
 ---
 
-## ⚙️ CÔNG NGHỆ SỬ DỤNG
+## 2. Kiểm tra trước khi cài đặt (áp dụng cho **tất cả** các node)
 
-> Liệt kê công nghệ, framework, thư viện chính mà nhóm sử dụng.
+1. **Kiểm tra phiên bản glibc**
+   ```bash
+   ldd --version
+   ```
+2. **Kiểm tra phiên bản kernel**
+   ```bash
+   uname -r
+   ```
+3. **Ghi nhận địa chỉ mạng các interface**
+   ```bash
+   ip -br addr show
+   ```
+4. **Tắt swap hoàn toàn** (bắt buộc trước khi chạy kubeadm)
+   ```bash
+   sudo swapoff -a
+   # Kiểm tra lại
+   free -h | grep -i swap
 
-| Thành phần | Công nghệ | Ghi chú |
-|------------|-----------|---------|
-| Server | K8s + Cilium | REST API |
-| Client | Java + Java Swing | Gui Request TCP/UDP |
-| Backend | Java | Xu ly request TCP/UDP va tra ve phan hoi |
-| Triển khai | Docker + K8s | Dong goi va trien khai tren cac pod |
+   # Comment dòng swap trong /etc/fstab để tránh tự bật lại
+   sudo sed -i.bak '/\sswap\s/ s/^/#/' /etc/fstab
+
+   # Khởi động lại máy và xác nhận swap đã tắt
+   sudo reboot
+   ```
 
 ---
 
-## 🚀 HƯỚNG DẪN CHẠY DỰ ÁN
+## 3. Cài đặt container runtime (containerd)
 
-### 1. Clone repository
+Thực hiện trên **mọi node** sau khi máy khởi động lại.
+
+1. **Bật IPv4 packet forwarding & các kernel module cần thiết**
+   ```bash
+   cat <<'EOF_SYS' | sudo tee /etc/modules-load.d/containerd.conf
+   overlay
+   br_netfilter
+   EOF_SYS
+
+   sudo modprobe overlay
+   sudo modprobe br_netfilter
+
+   cat <<'EOF_SYSCTL' | sudo tee /etc/sysctl.d/99-kubernetes-cri.conf
+   net.bridge.bridge-nf-call-iptables  = 1
+   net.bridge.bridge-nf-call-ip6tables = 1
+   net.ipv4.ip_forward                 = 1
+   EOF_SYSCTL
+
+   sudo sysctl --system
+   ```
+
+2. **Cài containerd, runc và CNI plugin**
+   ```bash
+   sudo apt-get update
+   sudo apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
+
+   # Cài containerd từ kho chính thức của Ubuntu
+   sudo apt-get install -y containerd
+
+   # (Tuỳ chọn) cập nhật runc & CNI plugin bản mới nhất
+   sudo install -m 0755 -d /usr/local/lib/containerd
+   sudo curl -L https://github.com/opencontainers/runc/releases/download/v1.1.12/runc.amd64 -o /usr/local/sbin/runc
+   sudo chmod +x /usr/local/sbin/runc
+
+   sudo mkdir -p /opt/cni/bin
+   sudo curl -L https://github.com/containernetworking/plugins/releases/download/v1.4.0/cni-plugins-linux-amd64-v1.4.0.tgz | sudo tar -xz -C /opt/cni/bin
+   ```
+
+3. **Tạo cấu hình mặc định và chuyển sang `SystemdCgroup`**
+   ```bash
+   sudo mkdir -p /etc/containerd
+   sudo containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+   sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+   sudo systemctl enable containerd
+   sudo systemctl restart containerd
+   sudo systemctl status containerd --no-pager
+   ```
+
+---
+
+## 4. Cài kubeadm, kubelet, kubectl
+
+Thực hiện trên **mọi node**.
+
 ```bash
-git clone <repository-url>
-cd assignment-network-project
+sudo apt-get update
+sudo apt-get install -y apt-transport-https ca-certificates curl
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/kubernetes-apt-keyring.gpg
+
+echo 'deb [signed-by=/etc/apt/trusted.gpg.d/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /' | \
+  sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+sudo apt-get update
+sudo apt-get install -y kubelet kubeadm kubectl
+sudo apt-mark hold kubelet kubeadm kubectl
+
+sudo systemctl enable kubelet
+sudo systemctl start kubelet
 ```
 
-### 2. Chạy server
+---
+
+## 5. Cài và cấu hình Cilium CLI
+
+Chạy lệnh sau **trên control-plane node** để lấy phiên bản CLI mới nhất:
+
 ```bash
-cd source/server
-# Các lệnh để khởi động server
+CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+CLI_ARCH=amd64
+if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
+
+curl -L --fail --remote-name-all \
+  https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
+sudo tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
+rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
 ```
 
-### 3. Chạy client
+Sau khi cụm được khởi tạo (xem bước 6), cài đặt Cilium CNI:
+
 ```bash
-cd source/client
-# Các lệnh để khởi động client
+cilium install --version 1.18.3
+cilium status --wait
 ```
 
-### 4. Kiểm thử nhanh
+---
+
+## 6. Khởi tạo cụm Kubernetes bằng kubeadm
+
+### 6.1. Tạo file cấu hình cho control-plane
+
+Ví dụ file `kubeadm-config.yaml`:
+
+```yaml
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: v1.30.0
+controlPlaneEndpoint: "<CONTROL_PLANE_IP>:6443"
+networking:
+  podSubnet: "10.217.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+---
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+mode: "none"  # vì sử dụng Cilium thay thế kube-proxy
+```
+
+Điều chỉnh `controlPlaneEndpoint` theo IP thực tế (xem bước kiểm tra IP ở mục 2).
+
+### 6.2. Khởi tạo control-plane
+
 ```bash
-# Các lệnh test
+sudo kubeadm init --config kubeadm-config.yaml
+```
+
+Sau khi thành công:
+
+```bash
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+```
+
+Triển khai Cilium nếu chưa chạy ở bước 5, kiểm tra các Pod hệ thống:
+
+```bash
+kubectl get nodes -o wide
+kubectl get pods -A -o wide
+```
+
+### 6.3. Join worker nodes
+
+Trên mỗi worker, dùng lệnh `kubeadm join` được in ra sau khi init. Ví dụ:
+
+```bash
+sudo kubeadm join <CONTROL_PLANE_IP>:6443 \
+  --token <TOKEN> \
+  --discovery-token-ca-cert-hash sha256:<HASH>
+```
+
+Kiểm tra lại trên control-plane:
+
+```bash
+kubectl get nodes -o wide
 ```
 
 ---
 
-## 🔗 GIAO TIẾP (GIAO THỨC SỬ DỤNG)
+## 7. Triển khai workload mẫu
 
-| Endpoint | Protocol | Method | Input | Output |
-|----------|----------|--------|-------|--------|
-| `/health` | HTTP/1.1 | GET | — | `{"status": "ok"}` |
-| `/compute` | HTTP/1.1 | POST | `{"task":"sum","payload":[1,2,3]}` | `{"result":6}` |
+1. Build và publish image backend: xem `source/server/README.md`.
+2. Tạo Deployment/Service để chạy backend (ví dụ sử dụng `LoadBalancer` hoặc `NodePort`).
+3. Sử dụng `source/client/README.md` để gửi nhiều request TCP/UDP và quan sát bảng thống kê phân phối theo Pod IP.
 
----
+Sau khi triển khai, có thể quan sát đường đi gói tin bằng Cilium:
 
-## 📊 KẾT QUẢ THỰC NGHIỆM
-
-> Đưa ảnh chụp kết quả hoặc mô tả log chạy thử.
-
-![Demo Result](./statics/result.png)
-
----
-
-## 🧩 CẤU TRÚC DỰ ÁN
-```
-assignment-network-project/
-├── README.md
-├── INSTRUCTION.md
-├── statics/
-│   ├── diagram.png
-│   └── dataset_sample.csv
-└── source/
-    ├── .gitignore
-    ├── client/
-    │   ├── README.md
-    │   └── (client source files...)
-    ├── server/
-    │   ├── README.md
-    │   └── (server source files...)
-    └── (các module khác nếu có)
+```bash
+cilium service list
+cilium endpoint list
 ```
 
 ---
 
-## 🧩 HƯỚNG PHÁT TRIỂN THÊM
+## 8. Ghi chú & khắc phục sự cố
 
-> Nêu ý tưởng mở rộng hoặc cải tiến hệ thống.
-
-- [ ] Cải thiện giao diện người dùng
-- [ ] Thêm tính năng xác thực và phân quyền
-- [ ] Tối ưu hóa hiệu suất
-- [ ] Triển khai trên cloud
+- Kiểm tra swap phải tắt hoàn toàn trước khi join cụm.
+- Nếu `kubeadm init` báo lỗi với `preflight checks`, dùng `kubeadm reset` để làm sạch trước khi thử lại.
+- `containerd` cần chạy với `SystemdCgroup = true` để tương thích `kubelet --cgroup-driver=systemd`.
+- Trước khi chạy client, đảm bảo Service của backend đã mở NodePort hoặc LoadBalancer để máy client truy cập được.
 
 ---
 
-## 📝 GHI CHÚ
+## 9. Tài liệu liên quan
 
-- Repo tuân thủ đúng cấu trúc đã hướng dẫn trong `INSTRUCTION.md`.
-- Đảm bảo test kỹ trước khi submit.
-
----
-
-## 📚 TÀI LIỆU THAM KHẢO
-
-> (Nếu có) Liệt kê các tài liệu, API docs, hoặc nguồn tham khảo đã sử dụng.
+- File hướng dẫn gốc: `hd cài k8s.docx`
+- README thành phần backend: `source/server/README.md`
+- README thành phần client: `source/client/README.md`
